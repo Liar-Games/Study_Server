@@ -6,6 +6,7 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release && rm -rf src
 
 COPY . .
+RUN touch ./src/main.rs
 RUN cargo build --release
 
 
