@@ -110,6 +110,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                         println!("Valid Ticket! User ID: {}", data);
                                                         state.sessions.insert(data.clone(), game_tx.clone());
                                                                     connected_user_id = Some(data);
+                                                        _ = sender.send(Message::Text("우끼끼".to_string())).await;
                                                         // TODO
                                                     }
                                                     Ok(None) => {
