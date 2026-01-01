@@ -17,7 +17,7 @@ use actors::room_manager::{RoomManager, RoomManagerHandle};
 // Shared resources
 #[derive(Clone)]
 pub struct AppState {
-    // TODO (Later) : use connection pool
+    // TODO (Later) : use connection pool (redis)
     pub redis_client: redis::Client,
     pub session_handle: SessionHandle,
     pub room_manager: RoomManagerHandle,
@@ -26,7 +26,7 @@ pub struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
     // redis client
-    // TODO (Later) : use connection pool
+    // TODO (Later) : use connection pool(redis)
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
     let redis = redis::Client::open(redis_url).map_err(|e| AppError::Config {
         reason: format!("Invalid Redis URL: {e}").into(),
@@ -36,7 +36,9 @@ async fn main() -> Result<()> {
     let (manager, handle) = SessionManager::new();
     tokio::spawn(async move {
         println!("Session Manager Started");
-        manager.run().await;
+        if let Err(e) = manager.run().await {
+            eprintln!("Session Manager stopped: {}", e);
+        }
     });
 
     // [Actor] Start Room Manager
@@ -44,7 +46,9 @@ async fn main() -> Result<()> {
     let (room_manager_actor, room_manager) = RoomManager::new();
     tokio::spawn(async move {
         println!("Room Manager Started");
-        room_manager_actor.run().await;
+        if let Err(e) = room_manager_actor.run().await {
+            eprintln!("Room Manager stopped: {}", e);
+        }
     });
 
     /////////
@@ -61,7 +65,7 @@ async fn main() -> Result<()> {
     // server setup
     // TODO : hardcoded enviorment variables
     let app = Router::new().route("/", get(ws_handler)).with_state(state);
-    let port = 8080;
+    let port = 8081;
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await

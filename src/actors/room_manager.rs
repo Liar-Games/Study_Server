@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actors::RoomType;
-use crate::actors::messages::{ActorId, ClientMessage, RoomManagerCommand};
+use crate::actors::messages::RoomManagerCommand;
 use crate::actors::rooms::RoomHandle;
 use crate::actors::rooms::global::GlobalRoomActor;
-use study_server::AppError;
+use study_server::{AppError, Result};
 
 /// [Actor] Room Manager
 pub struct RoomManager {
@@ -24,41 +24,44 @@ impl RoomManager {
         (actor, RoomManagerHandle { sender: tx })
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(mut self) -> Result<()> {
         while let Some(cmd) = self.receiver.recv().await {
             match cmd {
                 RoomManagerCommand::Join {
                     room_type,
                     room_id,
-                    user_id : _,
-                    tx : _,
                     reply,
                 } => {
                     // 1. check if the room already exists
                     if let Some(handle) = self.rooms.get(&room_id) {
-                        // return handle
-                        // TODO : actual room joining should be requested by the user after receiving the handle
-                        let _ = reply.send(Ok(handle.clone()));
+                        if reply.send(Ok(handle.clone())).is_err() {
+                            eprintln!("RoomManager: requester dropped for room_id={}", room_id);
+                        }
                     } else {
                         // 2. create new room
                         println!("RoomManager: Creating new room '{}'", room_id);
                         // TODO : make RoomType
                         let (room_actor, room_handle) = match room_type {
-                            RoomType::Global => GlobalRoomActor::new(), // 기본 로직
-                            _ => GlobalRoomActor::new(),                // TODO : other room types
+                            RoomType::Global => GlobalRoomActor::new(room_id.clone()), // 기본 로직
+                            _ => GlobalRoomActor::new(room_id.clone()),                // TODO : other room types
                         };
 
                         // run the room actor in a separate task
                         tokio::spawn(async move {
-                            room_actor.run().await;
+                            if let Err(e) = room_actor.run().await {
+                                eprintln!("Room actor exited with error: {}", e);
+                            }
                         });
 
                         self.rooms.insert(room_id.clone(), room_handle.clone());
-                        let _ = reply.send(Ok(room_handle));
+                        if reply.send(Ok(room_handle)).is_err() {
+                            eprintln!("RoomManager: requester dropped after creating room_id={}", room_id);
+                        }
                     }
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -73,24 +76,23 @@ impl RoomManagerHandle {
         &self,
         room_type: RoomType,
         room_id: String,
-        user_id: ActorId,
-        tx: mpsc::Sender<ClientMessage>,
-    ) -> Result<RoomHandle, AppError> {
+    ) -> Result<RoomHandle> {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let room_id_clone = room_id.clone();
 
-        let _ = self
-            .sender
+        self.sender
             .send(RoomManagerCommand::Join {
                 room_type,
                 room_id,
-                user_id,
-                tx,
                 reply: reply_tx,
             })
-            .await;
+            .await
+            .map_err(|_| AppError::RoomManager {
+                reason: "room manager mailbox closed".into(),
+            })?;
 
         reply_rx.await.map_err(|e| AppError::RoomManager {
-            reason: format!("No reply from manager - {}", e).into(),
+            reason: format!("room manager dropped reply for room_id={} - {}", room_id_clone, e).into(),
         })?
     }
 }
