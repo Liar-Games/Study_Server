@@ -9,6 +9,7 @@
 
 use tokio::sync::mpsc;
 use std::collections::HashMap;
+use bytes::Bytes;
 use study_server::{AppError, Result};
 use crate::actors::messages::{ActorId, ClientMessage, RoomMessage};
 use study_server::error::SessionSendError;
@@ -140,7 +141,7 @@ impl GlobalRoomActor {
     /// implement your game logic in this function.
     /// 
     /// ///////////////
-    async fn handle_game_logic(&mut self, user_id: ActorId, data: Vec<u8>) -> Result<()> {
+    async fn handle_game_logic(&mut self, user_id: ActorId, data: Bytes) -> Result<()> {
         if data.is_empty() { return Ok(()); }
 
         let op_code = data[0]; // Game's OpCode

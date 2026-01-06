@@ -1,4 +1,5 @@
 use tokio::sync::mpsc;
+use bytes::Bytes;
 use study_server::{AppError, Result};
 use crate::actors::messages::{ActorId, ClientMessage, RoomMessage};
 
@@ -43,7 +44,7 @@ impl RoomHandle {
             })
     }
     
-    pub async fn send_packet(&self, user_id: ActorId, data: Vec<u8>) -> Result<()> {
+    pub async fn send_packet(&self, user_id: ActorId, data: Bytes) -> Result<()> {
         self.sender
             .send(RoomMessage::GamePacket { user_id, data })
             .await
