@@ -5,6 +5,7 @@ use futures::{sink::SinkExt, stream::StreamExt};
 use redis::AsyncCommands;
 use study_server::{AppError, Result};
 use tokio::sync::mpsc;
+use bytes::Bytes;
 
 use crate::actors::PacketTag;
 use crate::actors::RoomType;
@@ -12,6 +13,7 @@ use crate::actors::messages::ClientMessage;
 use crate::actors::room_manager::RoomManagerHandle;
 use crate::actors::rooms::RoomHandle;
 use crate::actors::session_manager::SessionHandle;
+
 
 /// [Actor] Client Actor
 /// each connected user is one ClientActor
@@ -211,7 +213,8 @@ impl ClientActor {
                     match result {
                         Some(Ok(msg)) => {
                             match msg {
-                                Message::Binary(data) => self.handle_binary(data).await?,
+
+                                Message::Binary(data) => self.handle_binary(data.into()).await?,
                                 Message::Close(_) => break,
                                 Message::Ping(_) | Message::Pong(_) => { /* keep-alive frames */ }
                                 _ => {
@@ -236,7 +239,7 @@ impl ClientActor {
     }
 
     /// 3. Handle Binary Packets (Heartbeat, Game Logic, etc.)
-    async fn handle_binary(&mut self, data: Vec<u8>) -> Result<()> {
+    async fn handle_binary(&mut self, data: Bytes) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -247,9 +250,9 @@ impl ClientActor {
             }
             Some(PacketTag::Game) => {
                 if data.len() > 1 {
-                    let game_payload = data[1..].to_vec();
-                    // TODO : clone okay?
-                    // TODO : now using only "global" room. need room selection protocol between joined rooms.
+
+                    let game_payload = data.slice(1..);
+                    let target = self.route(game_payload.clone());
                     if let Some(room) = self.joined_rooms.get("global") {
                         room.send_packet(self.id.clone(), game_payload).await?;
                     } else {
@@ -284,6 +287,13 @@ impl ClientActor {
         }
         println!("ClientActor: {} cleanup done.", self.id);
         Ok(())
+
+    }
+
+    // helper
+    fn route(&self, _payload: Bytes) -> String {
+        // you may implement routing logic based on payload
+        "global".to_string()
     }
 
     // helper

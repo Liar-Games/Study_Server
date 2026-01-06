@@ -1,4 +1,5 @@
 use tokio::sync::{mpsc, oneshot};
+use bytes::Bytes;
 
 /* Custom Libraries */
 use study_server::{Result};
@@ -61,7 +62,7 @@ pub enum RoomMessage {
     /// game data packet (OpCode + Payload)
     GamePacket {
         user_id: ActorId,
-        data: Vec<u8>, 
+        data: Bytes, 
     }
 }
 
