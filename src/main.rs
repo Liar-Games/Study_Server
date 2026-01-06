@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
     // server setup
     // TODO : hardcoded enviorment variables
     let app = Router::new().route("/", get(ws_handler)).with_state(state);
-    let port = 8081;
+    let port = 8080;
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
