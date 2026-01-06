@@ -36,7 +36,9 @@ async fn main() -> Result<()> {
     let (manager, handle) = SessionManager::new();
     tokio::spawn(async move {
         println!("Session Manager Started");
-        manager.run().await;
+        if let Err(e) = manager.run().await {
+            eprintln!("Session Manager stopped: {}", e);
+        }
     });
 
     // [Actor] Start Room Manager
@@ -44,7 +46,9 @@ async fn main() -> Result<()> {
     let (room_manager_actor, room_manager) = RoomManager::new();
     tokio::spawn(async move {
         println!("Room Manager Started");
-        room_manager_actor.run().await;
+        if let Err(e) = room_manager_actor.run().await {
+            eprintln!("Room Manager stopped: {}", e);
+        }
     });
 
     /////////

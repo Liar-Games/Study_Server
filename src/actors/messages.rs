@@ -68,16 +68,12 @@ pub enum RoomMessage {
 // 4. Send Messages to Room Manager Actor 
 #[derive(Debug)]
 pub enum RoomManagerCommand {
-    /// request to join a room
+    /// request to create or fetch a room handle
     /// - room_id: name of the room to join (e.g., "global", "game_1")
-    /// - user_id: client actor id
-    /// - tx: channel to send messages to the user
     /// - reply: channel to receive the room handle
     Join {
         room_type: RoomType,
         room_id: String,
-        user_id: ActorId,
-        tx: mpsc::Sender<ClientMessage>,
         reply: oneshot::Sender<Result<RoomHandle>>, 
     },
 }

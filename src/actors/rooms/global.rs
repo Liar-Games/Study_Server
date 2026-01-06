@@ -9,7 +9,9 @@
 
 use tokio::sync::mpsc;
 use std::collections::HashMap;
+use study_server::{AppError, Result};
 use crate::actors::messages::{ActorId, ClientMessage, RoomMessage};
+use study_server::error::SessionSendError;
 use super::RoomHandle;
 
 /// [Actor] Room Actor
@@ -30,7 +32,7 @@ pub struct GlobalRoomActor {
 }
 
 impl GlobalRoomActor {
-    pub fn new() -> (Self, RoomHandle) {
+    pub fn new(room_id: String) -> (Self, RoomHandle) {
         // message queue size = 128
         // TODO : drop logic when full
         let (tx, rx) = mpsc::channel(128);
@@ -41,17 +43,20 @@ impl GlobalRoomActor {
             shared_counter: 0,
         };
         
-        let handle = RoomHandle { sender: tx };
+        let handle = RoomHandle { sender: tx, room_id };
         (actor, handle)
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(mut self) -> Result<()> {
         while let Some(cmd) = self.receiver.recv().await {
-            self.handle_command(cmd).await;
+            if let Err(e) = self.handle_command(cmd).await {
+                eprintln!("GlobalRoomActor error: {}", e);
+            }
         }
+        Ok(())
     }
 
-    async fn handle_command(&mut self, cmd: RoomMessage) {
+    async fn handle_command(&mut self, cmd: RoomMessage) -> Result<()> {
         match cmd {
             RoomMessage::Join { user_id, tx } => {
                 self.occupants.insert(user_id.clone(), tx);
@@ -64,23 +69,30 @@ impl GlobalRoomActor {
             }
             
             RoomMessage::GamePacket { user_id, data } => {
-                self.handle_game_logic(user_id, data).await;
+                self.handle_game_logic(user_id, data).await?;
             }
         }
+        Ok(())
     }
 
     /// Helper functions for messaging
     /// 1. Unicast
-    async fn unicast(&self, target_id: &ActorId, op_code: u8, payload: &[u8]) {
+    async fn unicast(&self, target_id: &ActorId, op_code: u8, payload: &[u8]) -> Result<()> {
         if let Some(tx) = self.occupants.get(target_id) {
             let packet = self.make_packet(op_code, payload);
-            let _ = tx.send(ClientMessage::SendBinary(packet)).await;
+            tx.send(ClientMessage::SendBinary(packet))
+                .await
+                .map_err(|_| AppError::SessionSendFailed {
+                    user_id: target_id.clone(),
+                    source: SessionSendError,
+                })?;
         }
+        Ok(())
     }
 
     /// 2. Broadcast
     /// - exclude_id: Some(id) to exclude specific user from broadcast (e.g., sender itself)
-    async fn broadcast(&self, op_code: u8, payload: &[u8], exclude_id: Option<&ActorId>) {
+    async fn broadcast(&self, op_code: u8, payload: &[u8], exclude_id: Option<&ActorId>) -> Result<()> {
         let packet = self.make_packet(op_code, payload);
         
         for (uid, tx) in &self.occupants {
@@ -88,19 +100,31 @@ impl GlobalRoomActor {
                 if uid == ex_id { continue; }
             }
             // TODO : clone okay??
-            let _ = tx.send(ClientMessage::SendBinary(packet.clone())).await;
+            tx.send(ClientMessage::SendBinary(packet.clone()))
+                .await
+                .map_err(|_| AppError::SessionSendFailed {
+                    user_id: uid.clone(),
+                    source: SessionSendError,
+                })?;
         }
+        Ok(())
     }
 
     /// 3. Broadcast Text
-    async fn broadcast_text(&self, text: String, exclude_id: Option<&ActorId>) {
+    async fn broadcast_text(&self, text: String, exclude_id: Option<&ActorId>) -> Result<()> {
         for (uid, tx) in &self.occupants {
             if let Some(ex_id) = exclude_id {
                 if uid == ex_id { continue; }
             }
             // TODO : clone okay??
-            let _ = tx.send(ClientMessage::SendText(text.clone())).await;
+            tx.send(ClientMessage::SendText(text.clone()))
+                .await
+                .map_err(|_| AppError::SessionSendFailed {
+                    user_id: uid.clone(),
+                    source: SessionSendError,
+                })?;
         }
+        Ok(())
     }
 
     /// helper's helper
@@ -116,8 +140,8 @@ impl GlobalRoomActor {
     /// implement your game logic in this function.
     /// 
     /// ///////////////
-    async fn handle_game_logic(&mut self, user_id: ActorId, data: Vec<u8>) {
-        if data.is_empty() { return; }
+    async fn handle_game_logic(&mut self, user_id: ActorId, data: Vec<u8>) -> Result<()> {
+        if data.is_empty() { return Ok(()); }
 
         let op_code = data[0]; // Game's OpCode
         let payload = &data[1..];
@@ -129,12 +153,12 @@ impl GlobalRoomActor {
                 for byte in &mut response {
                     *byte = byte.wrapping_add(1);
                 }
-                self.unicast(&user_id, 1, &response).await;
+                self.unicast(&user_id, 1, &response).await?;
             },
 
             // 2. Broadcast Example: relay to all occupants
             2 => {
-                self.broadcast(2, payload, Some(&user_id)).await;
+                self.broadcast(2, payload, Some(&user_id)).await?;
             },
 
             // 3. Room Memory change Example: add counter and notify all occupants
@@ -142,11 +166,12 @@ impl GlobalRoomActor {
                 self.shared_counter += 1;
                 let msg = format!("Room Counter: {}", self.shared_counter);
                 
-                self.broadcast_text(msg, None).await;
+                self.broadcast_text(msg, None).await?;
             }
 
             // TODO : AppError
             _ => println!("Unknown Game OpCode: {}", op_code),
         }
+        Ok(())
     }
 }

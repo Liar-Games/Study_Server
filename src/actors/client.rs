@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use axum::extract::ws::{Message, WebSocket};
 use futures::{sink::SinkExt, stream::StreamExt};
 use redis::AsyncCommands;
-use study_server::AppError;
+use study_server::{AppError, Result};
 use tokio::sync::mpsc;
 
 use crate::actors::PacketTag;
@@ -70,33 +70,36 @@ impl ClientActor {
             is_guest: false,
         };
 
-        // Authenticate and run
-        // TODO : AppError
         tokio::spawn(async move {
             // 1. Authenticate
-            if let Err(e) = actor.authenticate(tx).await {
+            if let Err(e) = actor.authenticate(tx.clone()).await {
                 eprintln!("Authentication failed: {}", e);
                 let _ = actor.ws_sender.send(Message::Close(None)).await;
                 return;
             }
 
             // 2. Main Loop
-            actor.run().await;
+            if let Err(e) = actor.run().await {
+                eprintln!("Client actor main loop error: {}", e);
+                // best-effort close; ignore error because socket may already be dead
+                let _ = actor.ws_sender.send(Message::Close(None)).await;
+            }
 
             // 3. Cleanup
-            actor.cleanup().await;
+            if let Err(e) = actor.cleanup().await {
+                eprintln!("Cleanup error: {}", e);
+            }
         });
     }
 
     /// 1. Authenticate
-    /// TODO : AppError
-    async fn authenticate(&mut self, my_tx: mpsc::Sender<ClientMessage>) -> Result<(), AppError> {
+    async fn authenticate(&mut self, my_tx: mpsc::Sender<ClientMessage>) -> Result<()> {
         // our websocket handshake -> Must receive a Ticket packet first
-        if let Some(Ok(msg)) = self.ws_receiver.next().await {
-            if let Message::Binary(bytes) = msg {
+        match self.ws_receiver.next().await {
+            Some(Ok(Message::Binary(bytes))) => {
                 if bytes.is_empty() || bytes[0] != PacketTag::Auth as u8 {
                     return Err(AppError::InvalidFrame {
-                        reason: format!("First packet is expected Ticket").into(),
+                        reason: "First frame must be auth".into(),
                     });
                 }
 
@@ -108,10 +111,8 @@ impl ClientActor {
                     self.id = "{\"id\":1557, \"name\":\"Guest_1557\"}".to_string();
 
                     self.login_process(my_tx).await?;
-
-                    let _ = self
-                        .send_packet(PacketTag::Text, b"Guest Login Success")
-                        .await;
+                    self.send_packet(PacketTag::Text, b"Guest Login Success")
+                        .await?;
                     return Ok(());
                 }
 
@@ -143,17 +144,26 @@ impl ClientActor {
                 // TODO : maybe game-load from DB here??
 
                 self.login_process(my_tx).await?;
-                let _ = self.send_packet(PacketTag::Text, b"Login Success").await;
-                return Ok(());
+                self.send_packet(PacketTag::Text, b"Login Success").await?;
+                Ok(())
             }
+            Some(Ok(Message::Text(_))) => Err(AppError::WebSocket {
+                reason: "Text frame not supported".into(),
+            }),
+            Some(Ok(Message::Close(_))) | None => Err(AppError::WebSocket {
+                reason: "Closed before auth".into(),
+            }),
+            Some(Ok(_)) => Err(AppError::WebSocket {
+                reason: "Unsupported websocket frame (expected binary)".into(),
+            }),
+            Some(Err(e)) => Err(AppError::WebSocket {
+                reason: format!("recv - {}", e).into(),
+            }),
         }
-        Err(AppError::SessionManager {
-            reason: "Connection closed before auth".into(),
-        })
     }
 
     // helper for login process
-    async fn login_process(&mut self, my_tx: mpsc::Sender<ClientMessage>) -> Result<(), AppError> {
+    async fn login_process(&mut self, my_tx: mpsc::Sender<ClientMessage>) -> Result<()> {
         // TODO : my_tx clone okay??
         self.session_handle
             .connect(self.id.clone(), my_tx.clone())
@@ -163,26 +173,34 @@ impl ClientActor {
             })?;
         // josin default "global" room
         self.join_room(RoomType::Global, "global".to_string(), my_tx)
-            .await;
+            .await?;
         Ok(())
     }
     /// 2. Main Loop
-    /// TODO : AppError
-    async fn run(&mut self) {
+    async fn run(&mut self) -> Result<()> {
         loop {
             tokio::select! {
                 // A. Get Messages from Server
-                Some(msg) = self.receiver.recv() => {
-                    match msg {
-                        ClientMessage::SendText(text) => {
-                            let _ = self.send_packet(PacketTag::Text, text.as_bytes()).await;
+                recv = self.receiver.recv() => {
+                    match recv {
+                        Some(msg) => {
+                            match msg {
+                                ClientMessage::SendText(text) => {
+                                    self.send_packet(PacketTag::Text, text.as_bytes()).await?;
+                                }
+                                ClientMessage::SendBinary(data) => {
+                                    self.send_packet(PacketTag::Binary, &data).await?;
+                                }
+                                ClientMessage::Kick { reason } => {
+                                    self.send_packet(PacketTag::TextError, format!("Kicked: {}", reason).as_bytes()).await?;
+                                    break; // Loop exit -> connection closed
+                                }
+                            }
                         }
-                        ClientMessage::SendBinary(data) => {
-                            let _ = self.send_packet(PacketTag::Binary, &data).await;
-                        }
-                        ClientMessage::Kick { reason } => {
-                            let _ = self.send_packet(PacketTag::TextError, format!("Kicked: {}", reason).as_bytes()).await;
-                            break; // Loop exit -> connection closed
+                        None => {
+                            eprintln!("ClientActor receiver closed for {}", self.id);
+                            let _ = self.ws_sender.send(Message::Close(None)).await;
+                            break;
                         }
                     }
                 }
@@ -192,56 +210,77 @@ impl ClientActor {
                     match result {
                         Some(Ok(msg)) => {
                             match msg {
-                                Message::Binary(data) => self.handle_binary(data).await,
+                                Message::Binary(data) => self.handle_binary(data).await?,
                                 Message::Close(_) => break,
-                                _ => {} // TODO : error (websocket data expected binary)
+                                Message::Ping(_) | Message::Pong(_) => { /* keep-alive frames */ }
+                                _ => {
+                                    return Err(AppError::WebSocket {
+                                        reason: "Unsupported frame type".into(),
+                                    });
+                                }
                             }
                         }
-                        Some(Err(_)) | None => break, // TODO : AppError
+                        Some(Err(e)) => {
+                            return Err(AppError::WebSocket { reason: format!("recv - {}", e).into() });
+                        }
+                        None => {
+                            // client closed connection
+                            break;
+                        }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// 3. Handle Binary Packets (Heartbeat, Game Logic, etc.)
-    /// TODO : AppError
-    async fn handle_binary(&mut self, data: Vec<u8>) {
+    async fn handle_binary(&mut self, data: Vec<u8>) -> Result<()> {
         if data.is_empty() {
-            return;
+            return Ok(());
         }
 
         match PacketTag::from_u8(data[0]) {
             Some(PacketTag::Heartbeat) => {
-                // Heartbeat packets need to keep / check a WebSocket connection.
-                // reply empty heartbeat packet.
-                let _ = self.send_packet(PacketTag::Heartbeat, &[]).await;
+                self.send_packet(PacketTag::Heartbeat, &[]).await?;
             }
             Some(PacketTag::Game) => {
                 if data.len() > 1 {
                     let game_payload = data[1..].to_vec();
-                    // TODO : clone okay?
-                    // TODO : now using only "global" room. need room selection protocol between joined rooms.
-                    self.joined_rooms
-                        .get(&"global".to_string())
-                        .unwrap()
-                        .send_packet(self.id.clone(), game_payload)
-                        .await;
+                    if let Some(room) = self.joined_rooms.get("global") {
+                        room.send_packet(self.id.clone(), game_payload).await?;
+                    } else {
+                        return Err(AppError::RoomManager {
+                            reason: "global room handle missing".into(),
+                        });
+                    }
                 }
             }
-            _ => {
-                println!("User {:?} sent game data: {:?}", self.id, data);
+            Some(_) => {
+                // Known PacketTag but not handled here (ex: Auth/Text/Binary)
+                return Err(AppError::WebSocket {
+                    reason: format!("unexpected packet tag in binary handler: {}", data[0]).into(),
+                });
+            }
+            None => {
+                return Err(AppError::UnknownSocketType { value: data[0] });
             }
         }
+        Ok(())
     }
 
     /// 3. Cleanup on Disconnect
-    async fn cleanup(&self) {
+    async fn cleanup(&mut self) -> Result<()> {
         for (_rid, handle) in &self.joined_rooms {
-            handle.leave(self.id.clone()).await;
+            if let Err(e) = handle.leave(self.id.clone()).await {
+                eprintln!("cleanup leave failed (user {}): {}", self.id, e);
+            }
         }
-        self.session_handle.disconnect(self.id.clone()).await;
+        if let Err(e) = self.session_handle.disconnect(self.id.clone()).await {
+            eprintln!("cleanup disconnect failed (user {}): {}", self.id, e);
+        }
         println!("ClientActor: {} cleanup done.", self.id);
+        Ok(())
     }
 
     // helper
@@ -249,7 +288,7 @@ impl ClientActor {
     // make buffer and accumulate data.
     // this logic handles in each game-logic actor
     // TODO : making packet vector every send is inefficient. is there zero-copy way?
-    async fn send_packet(&mut self, tag: PacketTag, payload: &[u8]) -> Result<(), AppError> {
+    async fn send_packet(&mut self, tag: PacketTag, payload: &[u8]) -> Result<()> {
         let mut data = Vec::with_capacity(1 + payload.len());
         data.push(tag as u8);
         data.extend_from_slice(payload);
@@ -267,18 +306,15 @@ impl ClientActor {
         room_type: RoomType,
         room_id: String,
         my_tx: mpsc::Sender<ClientMessage>,
-    ) {
+    ) -> Result<()> {
         // request to Room Manager to join a room
-        match self
+        let handle = self
             .room_manager
-            .join_room(room_type, room_id.clone(), self.id.clone(), my_tx.clone())
-            .await
-        {
-            Ok(handle) => {
-                handle.join(self.id.clone(), my_tx).await;
-                self.joined_rooms.insert(room_id, handle);
-            }
-            Err(e) => eprintln!("Failed to join room: {}", e),
-        }
+            .join_room(room_type, room_id.clone())
+            .await?;
+
+        handle.join(self.id.clone(), my_tx).await?;
+        self.joined_rooms.insert(room_id, handle);
+        Ok(())
     }
 }
