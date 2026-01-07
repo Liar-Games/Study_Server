@@ -250,9 +250,7 @@ impl ClientActor {
             }
             Some(PacketTag::Game) => {
                 if data.len() > 1 {
-
                     let game_payload = data.slice(1..);
-                    let target = self.route(game_payload.clone());
                     if let Some(room) = self.joined_rooms.get("global") {
                         room.send_packet(self.id.clone(), game_payload).await?;
                     } else {
@@ -262,6 +260,7 @@ impl ClientActor {
                     }
                 }
             }
+            // you may add more PacketTag and handle them here
             Some(_) => {
                 // Known PacketTag but not handled here (ex: Auth/Text/Binary)
                 return Err(AppError::WebSocket {
@@ -291,12 +290,6 @@ impl ClientActor {
     }
 
     // helper
-    fn route(&self, _payload: Bytes) -> String {
-        // you may implement routing logic based on payload
-        "global".to_string()
-    }
-
-    // helper
     // TODO (Later) : send packet every request is inefficient.
     // make buffer and accumulate data.
     // data's priority logic handles in each game-logic actor
@@ -306,7 +299,7 @@ impl ClientActor {
         data.push(tag as u8);
         data.extend_from_slice(payload);
         self.ws_sender
-            .send(Message::Binary(data))
+            .send(Message::Binary(data.into()))
             .await
             .map_err(|e| AppError::WebSocket {
                 reason: format!("send - {}", e).into(),
