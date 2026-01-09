@@ -3,6 +3,7 @@ pub mod messages;
 pub mod client;
 pub mod session_manager;
 pub mod room_manager;
+pub mod matchmaker;
 pub mod rooms;
 
 
@@ -22,6 +23,7 @@ mod packet_tag {
         TextError = 3,
         Binary = 4,
         Game = 10,
+        JoinQueue = 11,
     }
     
     impl PacketTag {
@@ -33,6 +35,7 @@ mod packet_tag {
                 3 => Some(Self::TextError),
                 4 => Some(Self::Binary),
                 10 => Some(Self::Game),
+                11 => Some(Self::JoinQueue),
                 _ => None,
             }
         }

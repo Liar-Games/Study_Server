@@ -1,25 +1,26 @@
 use std::collections::HashMap;
 
 use axum::extract::ws::{Message, WebSocket};
+use bytes::Bytes;
 use futures::{sink::SinkExt, stream::StreamExt};
 use redis::AsyncCommands;
 use study_server::{AppError, Result};
 use tokio::sync::mpsc;
-use bytes::Bytes;
 
 use crate::actors::PacketTag;
 use crate::actors::RoomType;
+use crate::actors::matchmaker::MatchmakerHandle;
 use crate::actors::messages::ClientMessage;
 use crate::actors::room_manager::RoomManagerHandle;
 use crate::actors::rooms::RoomHandle;
 use crate::actors::session_manager::SessionHandle;
-
 
 /// [Actor] Client Actor
 /// each connected user is one ClientActor
 pub struct ClientActor {
     /// mailbox to receive messages (from server)
     receiver: mpsc::Receiver<ClientMessage>,
+    sender: mpsc::Sender<ClientMessage>,
 
     /// WebSocket Write
     ws_sender: futures::stream::SplitSink<WebSocket, Message>,
@@ -32,6 +33,9 @@ pub struct ClientActor {
 
     /// room handler
     room_manager: RoomManagerHandle,
+
+    /// matchmaker handler
+    matchmaker: MatchmakerHandle,
 
     /// joined rooms map (room_id -> RoomHandle)
     // TODO : HashMap is TOO powerful. use Vec or other structure.
@@ -53,6 +57,7 @@ impl ClientActor {
         session_handle: SessionHandle,
         redis_client: redis::Client,
         room_manager: RoomManagerHandle,
+        matchmaker: MatchmakerHandle,
     ) {
         let (ws_sender, ws_receiver) = socket.split();
 
@@ -62,10 +67,12 @@ impl ClientActor {
 
         let mut actor = Self {
             receiver: rx,
+            sender: tx.clone(),
             ws_sender,
             ws_receiver,
             session_handle,
             room_manager,
+            matchmaker,
             joined_rooms: HashMap::new(),
             redis_client,
             id: String::new(),
@@ -75,7 +82,7 @@ impl ClientActor {
         tokio::spawn(async move {
             // 1. Authenticate
             // TODO : tx.clone() okay??
-            if let Err(e) = actor.authenticate(tx.clone()).await {
+            if let Err(e) = actor.authenticate().await {
                 eprintln!("Authentication failed: {}", e);
                 let _ = actor.ws_sender.send(Message::Close(None)).await;
                 return;
@@ -96,7 +103,7 @@ impl ClientActor {
     }
 
     /// 1. Authenticate
-    async fn authenticate(&mut self, my_tx: mpsc::Sender<ClientMessage>) -> Result<()> {
+    async fn authenticate(&mut self) -> Result<()> {
         // our websocket handshake -> Must receive a Ticket packet first
         match self.ws_receiver.next().await {
             Some(Ok(Message::Binary(bytes))) => {
@@ -113,7 +120,7 @@ impl ClientActor {
                     // guest id format will change. see below user_id format's TODO.
                     self.id = "{\"id\":1557, \"name\":\"Guest_1557\"}".to_string();
 
-                    self.login_process(my_tx).await?;
+                    self.login_process().await?;
                     self.send_packet(PacketTag::Text, b"Guest Login Success")
                         .await?;
                     return Ok(());
@@ -146,7 +153,7 @@ impl ClientActor {
 
                 // TODO : maybe game-load from DB here??
 
-                self.login_process(my_tx).await?;
+                self.login_process().await?;
                 self.send_packet(PacketTag::Text, b"Login Success").await?;
                 Ok(())
             }
@@ -166,17 +173,16 @@ impl ClientActor {
     }
 
     // helper for login process
-    async fn login_process(&mut self, my_tx: mpsc::Sender<ClientMessage>) -> Result<()> {
-        // TODO : my_tx clone okay??
+    async fn login_process(&mut self) -> Result<()> {
         self.session_handle
-            .connect(self.id.clone(), my_tx.clone())
+            .connect(self.id.clone(), self.sender.clone())
             .await
             .map_err(|e| AppError::SessionManager {
                 reason: format!("Manager connect failed: {}", e).into(),
             })?;
         // josin default "global" room
-        self.join_room(RoomType::Global, "global".to_string(), my_tx)
-            .await?;
+        // TODO : join global room
+        self.join_room(RoomType::Global, "global".to_string()).await?;
         Ok(())
     }
     /// 2. Main Loop
@@ -198,6 +204,17 @@ impl ClientActor {
                                     self.send_packet(PacketTag::TextError, format!("Kicked: {}", reason).as_bytes()).await?;
                                     break; // Loop exit -> connection closed
                                 }
+                                ClientMessage::JoinRoom { room_id } => {
+                                    println!("Client {}: Match Found! Join room {}", self.id, room_id);
+                                    if let Err(e) = self.join_room(RoomType::InGame, room_id).await {
+                                         let _ = self.send_packet(PacketTag::TextError, format!("Match Join Error: {}", e).as_bytes()).await;
+                                    }
+                                }
+                                ClientMessage::ClosedRoom {room_id} => {
+                                    self.joined_rooms.remove(&room_id);
+                                    println!("Client {}: Left Room {}", self.id, room_id);
+                                    let _ = self.send_packet(PacketTag::Text, format!("ROOM_CLOSED:{}", room_id).as_bytes()).await;
+                                }
                             }
                         }
                         None => {
@@ -213,7 +230,6 @@ impl ClientActor {
                     match result {
                         Some(Ok(msg)) => {
                             match msg {
-
                                 Message::Binary(data) => self.handle_binary(data.into()).await?,
                                 Message::Close(_) => break,
                                 Message::Ping(_) | Message::Pong(_) => { /* keep-alive frames */ }
@@ -260,6 +276,11 @@ impl ClientActor {
                     }
                 }
             }
+            Some(PacketTag::JoinQueue) => {
+                // TODO : parse payload
+                self.matchmaker.join_queue(self.id.clone(), self.sender.clone()).await?;
+                self.send_packet(PacketTag::Text, b"Joined Queue").await?;
+            }
             // you may add more PacketTag and handle them here
             Some(_) => {
                 // Known PacketTag but not handled here (ex: Auth/Text/Binary)
@@ -286,7 +307,6 @@ impl ClientActor {
         }
         println!("ClientActor: {} cleanup done.", self.id);
         Ok(())
-
     }
 
     // helper
@@ -306,21 +326,25 @@ impl ClientActor {
             })
     }
 
-    // helper
-    async fn join_room(
-        &mut self,
-        room_type: RoomType,
-        room_id: String,
-        my_tx: mpsc::Sender<ClientMessage>,
-    ) -> Result<()> {
-        // request to Room Manager to join a room
-        let handle = self
-            .room_manager
-            .join_room(room_type, room_id.clone())
-            .await?;
-
-        handle.join(self.id.clone(), my_tx).await?;
-        self.joined_rooms.insert(room_id, handle);
+    // TODO : return type refactoring
+    async fn join_room(&mut self, room_type: RoomType, room_id: String) -> Result<()> {
+        // Get Room Handle
+        let handle = match self.room_manager.get_room(room_id.clone()).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Client {} : failed to find room {}: {}", self.id, room_id, e);
+                self.send_packet(PacketTag::TextError, format!("Room '{}' not found.", room_id).as_bytes()).await?;
+                return Ok(());
+            }
+        };
+        // Try join room
+        if let Err(e) = handle.join(self.id.clone(), self.sender.clone()).await {
+            eprintln!("Client {} : failed to join room actor {}: {}", self.id, room_id, e);
+            self.send_packet(PacketTag::TextError, format!("Failed to enter room: {}", e).as_bytes()).await?;
+            return Ok(());
+        };
+        self.joined_rooms.insert(room_id.clone(), handle);
+        println!("Client {}: Joined Room '{}'", self.id, room_id);
         Ok(())
     }
 }

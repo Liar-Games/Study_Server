@@ -73,6 +73,11 @@ impl GlobalRoomActor {
             RoomMessage::GamePacket { user_id, data } => {
                 self.handle_game_logic(user_id, data).await?;
             }
+            RoomMessage::EndGame => {
+                println!("GlobalRoom: EndGame");
+                // cleanup logic
+                // in common situation, global room should not be ended.
+            }
         }
         Ok(())
     }

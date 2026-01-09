@@ -13,3 +13,10 @@ bytes = "1"
 dashmap = "6.0"
 thiserror = "1"
 tracing = "0.1"
+
+[dependencies.uuid]
+version = "1.19.0"
+# Lets you generate random UUIDs
+features = [
+    "v4",
+]
