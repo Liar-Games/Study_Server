@@ -9,6 +9,7 @@
 
 use tokio::sync::mpsc;
 use std::collections::HashMap;
+
 use bytes::Bytes;
 use study_server::{AppError, Result};
 use crate::actors::messages::{ActorId, ClientMessage, RoomMessage};
@@ -71,6 +72,11 @@ impl GlobalRoomActor {
             
             RoomMessage::GamePacket { user_id, data } => {
                 self.handle_game_logic(user_id, data).await?;
+            }
+            RoomMessage::EndGame => {
+                println!("GlobalRoom: EndGame");
+                // cleanup logic
+                // in common situation, global room should not be ended.
             }
         }
         Ok(())
@@ -141,6 +147,7 @@ impl GlobalRoomActor {
     /// implement your game logic in this function.
     /// 
     /// ///////////////
+
     async fn handle_game_logic(&mut self, user_id: ActorId, data: Bytes) -> Result<()> {
         if data.is_empty() { return Ok(()); }
 

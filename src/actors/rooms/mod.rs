@@ -1,17 +1,20 @@
 use tokio::sync::mpsc;
+
 use bytes::Bytes;
 use study_server::{AppError, Result};
 use crate::actors::messages::{ActorId, ClientMessage, RoomMessage};
 
 
 pub mod global;
+pub mod ingame;
 // you may add more room actors here
 
 // roomtype example
 #[derive(Debug)]
 pub enum RoomType {
     Global,
-    RoomExample, // you may add more room types here
+    InGame,
+    // you may add more room types here
 }
 
 /// handler to communicate with Room Actor
@@ -44,6 +47,7 @@ impl RoomHandle {
             })
     }
     
+
     pub async fn send_packet(&self, user_id: ActorId, data: Bytes) -> Result<()> {
         self.sender
             .send(RoomMessage::GamePacket { user_id, data })

@@ -16,6 +16,8 @@ pub enum ClientMessage {
     SendText(String),
     SendBinary(Vec<u8>),
     Kick { reason: String },
+    JoinRoom { room_id: String },
+    ClosedRoom { room_id: String  },
 }
 
 // 2. Send Messages to Server (SessionManager)
@@ -63,18 +65,37 @@ pub enum RoomMessage {
     GamePacket {
         user_id: ActorId,
         data: Bytes, 
-    }
+    },
+    
+    EndGame,
 }
 
 // 4. Send Messages to Room Manager Actor 
 #[derive(Debug)]
 pub enum RoomManagerCommand {
-    /// request to create or fetch a room handle
-    /// - room_id: name of the room to join (e.g., "global", "game_1")
-    /// - reply: channel to receive the room handle
-    Join {
+    CreateRoom{
         room_type: RoomType,
+        room_id: Option<String>, // If None, the RoomManager generates a unique ID
+        reply: oneshot::Sender<Result<(String,RoomHandle)>>,
+    },
+    GetRoom {
         room_id: String,
-        reply: oneshot::Sender<Result<RoomHandle>>, 
+        reply: oneshot::Sender<Result<RoomHandle>>,
+    },
+    DeleteRoom{
+        room_id: String,
+    }
+}
+
+
+// 5. Send Messages to MatchMaker Actor 
+#[derive(Debug)]
+pub enum MatchmakerCommand {
+    JoinQueue {
+        user_id: ActorId,
+        tx: mpsc::Sender<ClientMessage>, 
+    },
+    LeaveQueue {
+        user_id: ActorId,
     },
 }

@@ -14,19 +14,22 @@ use actors::client::ClientActor;
 use actors::session_manager::{SessionManager,SessionHandle};
 use actors::room_manager::{RoomManager, RoomManagerHandle};
 
+use crate::actors::{RoomType, matchmaker::{Matchmaker, MatchmakerHandle}};
+
 // Shared resources
 #[derive(Clone)]
 pub struct AppState {
-    // TODO (Later) : use connection pool
+    // TODO (Later) : use connection pool (redis)
     pub redis_client: redis::Client,
     pub session_handle: SessionHandle,
     pub room_manager: RoomManagerHandle,
+    pub matchmaker: MatchmakerHandle,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // redis client
-    // TODO (Later) : use connection pool
+    // TODO (Later) : use connection pool(redis)
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
     let redis = redis::Client::open(redis_url).map_err(|e| AppError::Config {
         reason: format!("Invalid Redis URL: {e}").into(),
@@ -45,10 +48,16 @@ async fn main() -> Result<()> {
     // Note : RoomManger start "global" room actor too
     let (room_manager_actor, room_manager) = RoomManager::new();
     tokio::spawn(async move {
-        println!("Room Manager Started");
         if let Err(e) = room_manager_actor.run().await {
             eprintln!("Room Manager stopped: {}", e);
         }
+    });
+    room_manager.create_room(RoomType::Global, Some("global".to_string())).await?;
+
+    // [Actor] Start Matchmaker (RoomManager Handle 필요)
+    let (matchmaker_actor, matchmaker) = Matchmaker::new(room_manager.clone());
+    tokio::spawn(async move {
+        matchmaker_actor.run().await;
     });
 
     /////////
@@ -60,6 +69,7 @@ async fn main() -> Result<()> {
         redis_client: redis,
         session_handle: handle,
         room_manager: room_manager,
+        matchmaker: matchmaker,
     };
 
     // server setup
@@ -94,6 +104,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
                 state.session_handle,
                 state.redis_client,
                 state.room_manager,
+                state.matchmaker,
             )
             .await;
         }
