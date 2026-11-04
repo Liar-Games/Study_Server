@@ -1,81 +1,137 @@
-use std::collections::VecDeque;
-use tokio::sync::mpsc;
-use crate::actors::messages::{ActorId, ClientMessage, MatchmakerCommand};
-use crate::actors::room_manager::RoomManagerHandle;
-use crate::actors::RoomType;
-use study_server::Result;
+//! Optional FIFO matching. One entry per session, O(log n) insertion/removal.
+use crate::{
+    Error, Result,
+    actors::{client::ClientHandle, room_manager::RoomManager},
+    protocol::{self, Reply},
+    types::SessionId,
+};
+use std::collections::{BTreeMap, HashMap};
+use tokio::sync::{mpsc, oneshot, watch};
 
-pub struct Matchmaker {
-    receiver: mpsc::Receiver<MatchmakerCommand>,
-    room_manager: RoomManagerHandle,
-    queue: VecDeque<(ActorId, mpsc::Sender<ClientMessage>)>,
+enum Command {
+    Join(ClientHandle, oneshot::Sender<Result<()>>),
+    Leave(SessionId, oneshot::Sender<()>),
+    Count(oneshot::Sender<usize>),
 }
-
+#[derive(Clone)]
+pub struct Matchmaker {
+    tx: mpsc::Sender<Command>,
+}
 impl Matchmaker {
-    pub fn new(room_manager: RoomManagerHandle) -> (Self, MatchmakerHandle) {
-        let (tx, rx) = mpsc::channel(32);
-        let actor = Self {
-            receiver: rx,
-            room_manager,
-            queue: VecDeque::new(),
-        };
-        (actor, MatchmakerHandle { sender: tx })
-    }
-
-    pub async fn run(mut self) {
-        println!("Matchmaker Started");
-        loop {
-            if let Some(cmd) = self.receiver.recv().await {
-                match cmd {
-                    MatchmakerCommand::JoinQueue { user_id, tx } => {
-                        println!("Matchmaker: User {} joined queue. Total : {}", user_id, self.queue.len() + 1);
-                        self.queue.push_back((user_id, tx));
+    pub(crate) fn start(
+        rooms: RoomManager,
+        size: usize,
+        capacity: usize,
+        mut stop: watch::Receiver<bool>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
+        let (tx, mut rx) = mpsc::channel(128);
+        let task = tokio::spawn(async move {
+            let mut queue = BTreeMap::<u64, ClientHandle>::new();
+            let mut index = HashMap::new();
+            let mut sequence = 0u64;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => break,
+                    cmd = rx.recv() => match cmd {
+                        Some(Command::Join(client, reply)) => {
+                            let result = if size == 0 { Err(Error::Denied) }
+                            else if client.is_closed() { Err(Error::Closed) }
+                            else if !rooms.eligible(&client).await.unwrap_or(false) { Err(Error::Denied) }
+                            else {
+                                match index.entry(client.id()) {
+                                    std::collections::hash_map::Entry::Occupied(_) => Err(Error::AlreadyQueued),
+                                    std::collections::hash_map::Entry::Vacant(entry) => {
+                                        if queue.len() >= capacity { Err(Error::Limit) }
+                                        else {
+                                            sequence += 1;
+                                            entry.insert(sequence);
+                                            queue.insert(sequence, client);
+                                            Ok(())
+                                        }
+                                    }
+                                }
+                            };
+                            let _ = reply.send(result);
+                        },
+                        Some(Command::Leave(id, reply)) => {
+                            if let Some(key) = index.remove(&id) { queue.remove(&key); }
+                            let _ = reply.send(());
+                        },
+                        Some(Command::Count(reply)) => { let _ = reply.send(queue.len()); },
+                        None => break,
                     }
-                    MatchmakerCommand::LeaveQueue { user_id } => {
-                        // O(n) scan to remove
-                        if let Some(pos) = self.queue.iter().position(|(id, _)| id == &user_id) {
-                            self.queue.remove(pos);
+                }
+                // No polling timer: new arrivals and cancellations drive matching.
+                while size > 0 && queue.len() >= size {
+                    let mut players = Vec::with_capacity(size);
+                    while players.len() < size {
+                        let Some((key, client)) = queue.pop_first() else {
+                            break;
+                        };
+                        index.remove(&client.id());
+                        if rooms.eligible(&client).await.unwrap_or(false) {
+                            players.push((key, client));
                         }
                     }
-                }
-            } else {
-                break; // channel closed
-            }
-
-            // 2. Matching Logic 
-            // TODO : matching by ELO. (current : FIFO)
-            while self.queue.len() >= 2 {
-                // Extract 2 players
-                let (p1_id, p1_tx) = self.queue.pop_front().unwrap();
-                let (p2_id, p2_tx) = self.queue.pop_front().unwrap();
-
-                println!("Matchmaker: Matched {} vs {}", p1_id, p2_id);
-
-                // 2-1. Create a new game room
-                match self.room_manager.create_room(RoomType::InGame, None).await {
-                    Ok((room_id, _room_handle)) => {
-                        let _ = p1_tx.send(ClientMessage::JoinRoom { room_id: room_id.clone() }).await;
-                        let _ = p2_tx.send(ClientMessage::JoinRoom { room_id: room_id.clone() }).await;
+                    if players.len() < size {
+                        for (key, client) in players {
+                            index.insert(client.id(), key);
+                            queue.insert(key, client);
+                        }
+                        break;
                     }
-                    Err(e) => {
-                        eprintln!("Matchmaker: Failed to create room: {}", e);
+                    let result = rooms
+                        .match_create(players.iter().map(|(_, c)| c.clone()).collect(), size)
+                        .await;
+                    let result = match result {
+                        Ok(id) => Ok(id),
+                        Err(failure) if !failure.disqualified.is_empty() => {
+                            for (key, client) in players {
+                                if !failure.disqualified.contains(&client.id())
+                                    && !client.is_closed()
+                                {
+                                    index.insert(client.id(), key);
+                                    queue.insert(key, client);
+                                }
+                            }
+                            continue;
+                        }
+                        Err(failure) => Err(failure.error),
+                    };
+                    // Admission or capacity failure is explicit; every player may retry.
+                    let frame =
+                        protocol::json(protocol::REPLY, &Reply::new(None, result.map(Some)));
+                    for (_, client) in players {
+                        let _ = client.send(frame.clone());
                     }
                 }
             }
-        }
+        });
+        (Self { tx }, task)
     }
-}
-
-#[derive(Clone)]
-pub struct MatchmakerHandle {
-    sender: mpsc::Sender<MatchmakerCommand>,
-}
-
-impl MatchmakerHandle {
-    pub async fn join_queue(&self, user_id: ActorId, tx: mpsc::Sender<ClientMessage>) -> Result<()> {
-        self.sender.send(MatchmakerCommand::JoinQueue { user_id, tx })
-            .await.map_err(|_| study_server::AppError::Serve { 
-                source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Matchmaker died") 
-            }.into())
+    pub(crate) async fn join(&self, client: ClientHandle) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Join(client, tx))
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        rx.await.map_err(|_| Error::Unavailable)?
+    }
+    pub(crate) async fn leave(&self, id: SessionId) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Leave(id, tx))
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        rx.await.map_err(|_| Error::Unavailable)
+    }
+    pub async fn count(&self) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Count(tx))
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        rx.await.map_err(|_| Error::Unavailable)
     }
 }
