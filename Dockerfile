@@ -1,22 +1,17 @@
-FROM rust:slim AS builder
+ARG RUST_IMAGE=rust:1.91.1-bookworm
+FROM ${RUST_IMAGE} AS build
 WORKDIR /app
-
-COPY ./Cargo.toml ./Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release && rm -rf src
-
-COPY . .
-RUN touch ./src/main.rs
-RUN cargo build --release
-
-
-
-FROM debian:bookworm-slim
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/study_server /usr/local/bin/server
-ENV PORT=8080
-ENV RUST_LOG=info
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY tests ./tests
+COPY examples ./examples
+RUN cargo build --locked --release --all-targets
+FROM build AS test
+CMD ["cargo", "test", "--locked", "--all-targets"]
+FROM debian:bookworm-slim AS runtime
+RUN useradd --system --uid 10001 --no-create-home engine
+COPY --from=build /app/target/release/study_server /usr/local/bin/study-server
+USER 10001:10001
 EXPOSE 8080
-CMD ["server"]
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["study-server"]

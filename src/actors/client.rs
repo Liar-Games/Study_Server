@@ -1,350 +1,287 @@
-use std::collections::HashMap;
-
-use axum::extract::ws::{Message, WebSocket};
+//! A stable logical client handle; each connection owns a separate bounded inbox.
+use crate::{
+    Error, Result,
+    actors::room::RoomHandle,
+    types::{Player, RoomId, SessionId},
+};
 use bytes::Bytes;
-use futures::{sink::SinkExt, stream::StreamExt};
-use redis::AsyncCommands;
-use study_server::{AppError, Result};
-use tokio::sync::mpsc;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
+use tokio::sync::{mpsc, watch};
 
-use crate::actors::PacketTag;
-use crate::actors::RoomType;
-use crate::actors::matchmaker::MatchmakerHandle;
-use crate::actors::messages::ClientMessage;
-use crate::actors::room_manager::RoomManagerHandle;
-use crate::actors::rooms::RoomHandle;
-use crate::actors::session_manager::SessionHandle;
-
-/// [Actor] Client Actor
-/// each connected user is one ClientActor
-pub struct ClientActor {
-    /// mailbox to receive messages (from server)
-    receiver: mpsc::Receiver<ClientMessage>,
-    sender: mpsc::Sender<ClientMessage>,
-
-    /// WebSocket Write
-    ws_sender: futures::stream::SplitSink<WebSocket, Message>,
-
-    /// WebSocket Read
-    ws_receiver: futures::stream::SplitStream<WebSocket>,
-
-    /// session manager handler
-    session_handle: SessionHandle,
-
-    /// room handler
-    room_manager: RoomManagerHandle,
-
-    /// matchmaker handler
-    matchmaker: MatchmakerHandle,
-
-    /// joined rooms map (room_id -> RoomHandle)
-    // TODO : HashMap is TOO powerful. use Vec or other structure.
-    joined_rooms: HashMap<String, RoomHandle>,
-
-    /// Redis client
-    redis_client: redis::Client,
-
-    /// actorId (based on userID)
-    id: String,
-
-    // guest user (not logged in user)
-    is_guest: bool,
+#[derive(Debug)]
+pub enum ClientEvent {
+    Frame(Bytes),
+    Joined(RoomHandle),
+    Left(RoomId),
+}
+#[derive(Debug)]
+struct Transport {
+    tx: mpsc::Sender<ClientEvent>,
+    cancel: watch::Sender<bool>,
+}
+#[derive(Debug)]
+struct State {
+    generation: u64,
+    transport: Option<Transport>,
+    closed: bool,
+}
+#[derive(Clone, Debug)]
+pub struct ClientHandle {
+    player: Arc<Player>,
+    state: Arc<Mutex<State>>,
+    control: Arc<tokio::sync::Mutex<()>>,
+    capacity: usize,
+    max_frame: usize,
+}
+pub struct ClientInbox {
+    rx: mpsc::Receiver<ClientEvent>,
+    cancel: watch::Receiver<bool>,
+    pending: VecDeque<ClientEvent>,
+    capacity: usize,
+}
+pub struct ConnectedClient {
+    pub handle: ClientHandle,
+    pub inbox: ClientInbox,
+    pub generation: u64,
+    pub resume_token: String,
+    pub resumed: bool,
+}
+impl ClientHandle {
+    pub(crate) fn channel(player: Player, capacity: usize, max_frame: usize) -> ConnectedClient {
+        let handle = Self {
+            player: Arc::new(player),
+            state: Arc::new(Mutex::new(State {
+                generation: 0,
+                transport: None,
+                closed: false,
+            })),
+            control: Arc::new(tokio::sync::Mutex::new(())),
+            capacity,
+            max_frame,
+        };
+        handle.attach(false).expect("new client")
+    }
+    pub(crate) async fn control_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.control.clone().lock_owned().await
+    }
+    pub(crate) fn attach(&self, resumed: bool) -> Result<ConnectedClient> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return Err(Error::Closed);
+        }
+        if state.transport.is_some() && !resumed {
+            return Err(Error::AlreadyConnected);
+        }
+        let generation = state.generation.checked_add(1).ok_or(Error::Limit)?;
+        if let Some(old) = state.transport.take() {
+            old.cancel.send_replace(true);
+        }
+        state.generation = generation;
+        let (tx, rx) = mpsc::channel(self.capacity);
+        let (cancel, cancelled) = watch::channel(false);
+        state.transport = Some(Transport { tx, cancel });
+        Ok(ConnectedClient {
+            handle: self.clone(),
+            inbox: ClientInbox {
+                rx,
+                cancel: cancelled,
+                pending: VecDeque::new(),
+                capacity: self.capacity,
+            },
+            generation: state.generation,
+            resume_token: format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            resumed,
+        })
+    }
+    pub fn player(&self) -> &Player {
+        &self.player
+    }
+    pub fn id(&self) -> SessionId {
+        self.player.session_id
+    }
+    pub fn is_current(&self, generation: u64) -> bool {
+        let state = self.state.lock().unwrap();
+        state.generation == generation
+            && state
+                .transport
+                .as_ref()
+                .is_some_and(|t| !*t.cancel.borrow() && !t.tx.is_closed())
+            && !state.closed
+    }
+    pub fn is_closed(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.closed
+            || state
+                .transport
+                .as_ref()
+                .is_none_or(|t| *t.cancel.borrow() || t.tx.is_closed())
+    }
+    /// Cancel the current transport. The transport owner must subsequently suspend it.
+    pub fn close(&self) {
+        if let Some(t) = &self.state.lock().unwrap().transport {
+            t.cancel.send_replace(true);
+        }
+    }
+    pub(crate) fn close_final(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        if let Some(t) = state.transport.take() {
+            t.cancel.send_replace(true);
+        }
+    }
+    pub(crate) fn suspend(&self, generation: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.closed || state.generation != generation {
+            return false;
+        }
+        if let Some(t) = state.transport.take() {
+            t.cancel.send_replace(true);
+            true
+        } else {
+            false
+        }
+    }
+    /// Detect an abandoned inbox without letting an older connection cancel a new one.
+    pub(crate) fn suspend_closed(&self) -> Option<u64> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed
+            || !state
+                .transport
+                .as_ref()
+                .is_some_and(|t| *t.cancel.borrow() || t.tx.is_closed())
+        {
+            return None;
+        }
+        if let Some(t) = state.transport.take() {
+            t.cancel.send_replace(true);
+        }
+        Some(state.generation)
+    }
+    pub fn send(&self, frame: Bytes) -> Result<()> {
+        if frame.len() > self.max_frame {
+            return Err(Error::Limit);
+        }
+        self.deliver(ClientEvent::Frame(frame))
+    }
+    /// Transport replies must atomically check the connection and enqueue.
+    pub(crate) fn send_current(&self, generation: u64, frame: Bytes) -> Result<()> {
+        if frame.len() > self.max_frame {
+            return Err(Error::Limit);
+        }
+        self.deliver_at(Some(generation), ClientEvent::Frame(frame))
+    }
+    pub(crate) fn deliver(&self, event: ClientEvent) -> Result<()> {
+        self.deliver_at(None, event)
+    }
+    fn deliver_at(&self, generation: Option<u64>, event: ClientEvent) -> Result<()> {
+        let state = self.state.lock().unwrap();
+        if generation.is_some_and(|generation| generation != state.generation) {
+            return Err(Error::Closed);
+        }
+        let t = state
+            .transport
+            .as_ref()
+            .filter(|t| !state.closed && !*t.cancel.borrow())
+            .ok_or(Error::Closed)?;
+        t.tx.try_send(event).map_err(|e| {
+            t.cancel.send_replace(true);
+            match e {
+                mpsc::error::TrySendError::Full(_) => Error::Busy,
+                _ => Error::Closed,
+            }
+        })
+    }
+}
+impl ClientInbox {
+    pub(crate) fn restore_routes(&mut self, rooms: Vec<RoomHandle>) {
+        self.pending
+            .extend(rooms.into_iter().map(ClientEvent::Joined));
+    }
+    pub(crate) fn try_recv(&mut self) -> Option<ClientEvent> {
+        if *self.cancel.borrow() {
+            None
+        } else {
+            self.pending.pop_front().or_else(|| self.rx.try_recv().ok())
+        }
+    }
+    async fn receive(&mut self) -> Option<ClientEvent> {
+        if *self.cancel.borrow() {
+            return None;
+        }
+        tokio::select! { biased; _ = self.cancel.changed() => None, event = self.rx.recv() => event }
+    }
+    pub async fn recv(&mut self) -> Option<ClientEvent> {
+        if *self.cancel.borrow() {
+            return None;
+        }
+        if let Some(event) = self.pending.pop_front() {
+            return Some(event);
+        }
+        self.receive().await
+    }
+    /// Discover a route without discarding game frames queued before it.
+    /// If preceding frames fill the bounded pending queue, consume them with recv first.
+    pub async fn next_room(&mut self) -> Option<RoomHandle> {
+        if *self.cancel.borrow() {
+            return None;
+        }
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|event| matches!(event, ClientEvent::Joined(_)))
+            && let Some(ClientEvent::Joined(room)) = self.pending.remove(index)
+        {
+            return Some(room);
+        }
+        while self.pending.len() < self.capacity {
+            let event = self.receive().await?;
+            if let ClientEvent::Joined(room) = event {
+                return Some(room);
+            }
+            self.pending.push_back(event);
+        }
+        None
+    }
 }
 
-impl ClientActor {
-    pub async fn start(
-        socket: WebSocket,
-        session_handle: SessionHandle,
-        redis_client: redis::Client,
-        room_manager: RoomManagerHandle,
-        matchmaker: MatchmakerHandle,
-    ) {
-        let (ws_sender, ws_receiver) = socket.split();
-
-        // message queue size = 32
-        // TODO : drop logic when full
-        let (tx, rx) = mpsc::channel(32);
-
-        let mut actor = Self {
-            receiver: rx,
-            sender: tx.clone(),
-            ws_sender,
-            ws_receiver,
-            session_handle,
-            room_manager,
-            matchmaker,
-            joined_rooms: HashMap::new(),
-            redis_client,
-            id: String::new(),
-            is_guest: false,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Principal;
+    #[tokio::test]
+    async fn transport_responses_never_cross_into_a_replacement_generation() {
+        let first = ClientHandle::channel(
+            Player {
+                session_id: uuid::Uuid::new_v4(),
+                principal: Principal::guest(),
+                name: "guest".into(),
+                avatar_url: None,
+            },
+            8,
+            1024,
+        );
+        let mut second = first.handle.attach(true).unwrap();
+        assert_eq!(
+            first
+                .handle
+                .send_current(first.generation, Bytes::from_static(b"stale reply")),
+            Err(Error::Closed)
+        );
+        assert!(second.inbox.try_recv().is_none());
+        second
+            .handle
+            .send_current(second.generation, Bytes::from_static(b"current reply"))
+            .unwrap();
+        let Some(ClientEvent::Frame(frame)) = second.inbox.recv().await else {
+            panic!("missing current reply")
         };
-
-        tokio::spawn(async move {
-            // 1. Authenticate
-            // TODO : tx.clone() okay??
-            if let Err(e) = actor.authenticate().await {
-                eprintln!("Authentication failed: {}", e);
-                let _ = actor.ws_sender.send(Message::Close(None)).await;
-                return;
-            }
-
-            // 2. Main Loop
-            if let Err(e) = actor.run().await {
-                eprintln!("Client actor main loop error: {}", e);
-                // best-effort close; ignore error because socket may already be dead
-                let _ = actor.ws_sender.send(Message::Close(None)).await;
-            }
-
-            // 3. Cleanup
-            if let Err(e) = actor.cleanup().await {
-                eprintln!("Cleanup error: {}", e);
-            }
-        });
-    }
-
-    /// 1. Authenticate
-    async fn authenticate(&mut self) -> Result<()> {
-        // our websocket handshake -> Must receive a Ticket packet first
-        match self.ws_receiver.next().await {
-            Some(Ok(Message::Binary(bytes))) => {
-                if bytes.is_empty() || bytes[0] != PacketTag::Auth as u8 {
-                    return Err(AppError::InvalidFrame {
-                        reason: "First frame must be auth".into(),
-                    });
-                }
-
-                if bytes.len() < 2 {
-                    // Empty ticket -> guest user
-                    self.is_guest = true;
-                    // TODO : make unique guest id
-                    // guest id format will change. see below user_id format's TODO.
-                    self.id = "{\"id\":1557, \"name\":\"Guest_1557\"}".to_string();
-
-                    self.login_process().await?;
-                    self.send_packet(PacketTag::Text, b"Guest Login Success")
-                        .await?;
-                    return Ok(());
-                }
-
-                // Ticket Parse
-                let ticket =
-                    String::from_utf8(bytes[1..].to_vec()).map_err(|e| AppError::Utf8 {
-                        field: "ticket".into(),
-                        source: e,
-                    })?;
-
-                // Check Ticket in Redis
-                // TODO (LATER) : make redis connection every time is inefficient. use connection pool. (redis)
-                let mut conn = self
-                    .redis_client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(|e| AppError::Redis {
-                        reason: format!("Redis connection failed: {}", e).into(),
-                        source: e,
-                    })?;
-
-                // TODO : user_id format is JSON now. parse JSON and make ActorId from it.
-                let user_id: String = conn
-                    .get_del(format!("game_ticket:{}", ticket))
-                    .await
-                    .map_err(|_| AppError::InvalidTicket)?;
-                self.id = user_id;
-
-                // TODO : maybe game-load from DB here??
-
-                self.login_process().await?;
-                self.send_packet(PacketTag::Text, b"Login Success").await?;
-                Ok(())
-            }
-            Some(Ok(Message::Text(_))) => Err(AppError::WebSocket {
-                reason: "Text frame not supported".into(),
-            }),
-            Some(Ok(Message::Close(_))) | None => Err(AppError::WebSocket {
-                reason: "Closed before auth".into(),
-            }),
-            Some(Ok(_)) => Err(AppError::WebSocket {
-                reason: "Unsupported websocket frame (expected binary)".into(),
-            }),
-            Some(Err(e)) => Err(AppError::WebSocket {
-                reason: format!("recv - {}", e).into(),
-            }),
-        }
-    }
-
-    // helper for login process
-    async fn login_process(&mut self) -> Result<()> {
-        self.session_handle
-            .connect(self.id.clone(), self.sender.clone())
-            .await
-            .map_err(|e| AppError::SessionManager {
-                reason: format!("Manager connect failed: {}", e).into(),
-            })?;
-        // josin default "global" room
-        // TODO : join global room
-        self.join_room(RoomType::Global, "global".to_string()).await?;
-        Ok(())
-    }
-    /// 2. Main Loop
-    async fn run(&mut self) -> Result<()> {
-        loop {
-            tokio::select! {
-                // A. Get Messages from Server
-                recv = self.receiver.recv() => {
-                    match recv {
-                        Some(msg) => {
-                            match msg {
-                                ClientMessage::SendText(text) => {
-                                    self.send_packet(PacketTag::Text, text.as_bytes()).await?;
-                                }
-                                ClientMessage::SendBinary(data) => {
-                                    self.send_packet(PacketTag::Binary, &data).await?;
-                                }
-                                ClientMessage::Kick { reason } => {
-                                    self.send_packet(PacketTag::TextError, format!("Kicked: {}", reason).as_bytes()).await?;
-                                    break; // Loop exit -> connection closed
-                                }
-                                ClientMessage::JoinRoom { room_id } => {
-                                    println!("Client {}: Match Found! Join room {}", self.id, room_id);
-                                    if let Err(e) = self.join_room(RoomType::InGame, room_id).await {
-                                         let _ = self.send_packet(PacketTag::TextError, format!("Match Join Error: {}", e).as_bytes()).await;
-                                    }
-                                }
-                                ClientMessage::ClosedRoom {room_id} => {
-                                    self.joined_rooms.remove(&room_id);
-                                    println!("Client {}: Left Room {}", self.id, room_id);
-                                    let _ = self.send_packet(PacketTag::Text, format!("ROOM_CLOSED:{}", room_id).as_bytes()).await;
-                                }
-                            }
-                        }
-                        None => {
-                            eprintln!("ClientActor receiver closed for {}", self.id);
-                            let _ = self.ws_sender.send(Message::Close(None)).await;
-                            break;
-                        }
-                    }
-                }
-
-                // B. Get Messages from WebSocket
-                result = self.ws_receiver.next() => {
-                    match result {
-                        Some(Ok(msg)) => {
-                            match msg {
-                                Message::Binary(data) => self.handle_binary(data.into()).await?,
-                                Message::Close(_) => break,
-                                Message::Ping(_) | Message::Pong(_) => { /* keep-alive frames */ }
-                                _ => {
-                                    return Err(AppError::WebSocket {
-                                        reason: "Unsupported frame type".into(),
-                                    });
-                                }
-                            }
-                        }
-                        Some(Err(e)) => {
-                            return Err(AppError::WebSocket { reason: format!("recv - {}", e).into() });
-                        }
-                        None => {
-                            // client closed connection
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// 3. Handle Binary Packets (Heartbeat, Game Logic, etc.)
-    async fn handle_binary(&mut self, data: Bytes) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        match PacketTag::from_u8(data[0]) {
-            Some(PacketTag::Heartbeat) => {
-                self.send_packet(PacketTag::Heartbeat, &[]).await?;
-            }
-            Some(PacketTag::Game) => {
-                if data.len() > 1 {
-                    let game_payload = data.slice(1..);
-                    if let Some(room) = self.joined_rooms.get("global") {
-                        room.send_packet(self.id.clone(), game_payload).await?;
-                    } else {
-                        return Err(AppError::RoomManager {
-                            reason: "global room handle missing".into(),
-                        });
-                    }
-                }
-            }
-            Some(PacketTag::JoinQueue) => {
-                // TODO : parse payload
-                self.matchmaker.join_queue(self.id.clone(), self.sender.clone()).await?;
-                self.send_packet(PacketTag::Text, b"Joined Queue").await?;
-            }
-            // you may add more PacketTag and handle them here
-            Some(_) => {
-                // Known PacketTag but not handled here (ex: Auth/Text/Binary)
-                return Err(AppError::WebSocket {
-                    reason: format!("unexpected packet tag in binary handler: {}", data[0]).into(),
-                });
-            }
-            None => {
-                return Err(AppError::UnknownSocketType { value: data[0] });
-            }
-        }
-        Ok(())
-    }
-
-    /// 3. Cleanup on Disconnect
-    async fn cleanup(&mut self) -> Result<()> {
-        for (_rid, handle) in &self.joined_rooms {
-            if let Err(e) = handle.leave(self.id.clone()).await {
-                eprintln!("cleanup leave failed (user {}): {}", self.id, e);
-            }
-        }
-        if let Err(e) = self.session_handle.disconnect(self.id.clone()).await {
-            eprintln!("cleanup disconnect failed (user {}): {}", self.id, e);
-        }
-        println!("ClientActor: {} cleanup done.", self.id);
-        Ok(())
-    }
-
-    // helper
-    // TODO (Later) : send packet every request is inefficient.
-    // make buffer and accumulate data.
-    // data's priority logic handles in each game-logic actor
-    // TODO : making packet vector every send is inefficient. is there zero-copy way?
-    async fn send_packet(&mut self, tag: PacketTag, payload: &[u8]) -> Result<()> {
-        let mut data = Vec::with_capacity(1 + payload.len());
-        data.push(tag as u8);
-        data.extend_from_slice(payload);
-        self.ws_sender
-            .send(Message::Binary(data.into()))
-            .await
-            .map_err(|e| AppError::WebSocket {
-                reason: format!("send - {}", e).into(),
-            })
-    }
-
-    // TODO : return type refactoring
-    async fn join_room(&mut self, room_type: RoomType, room_id: String) -> Result<()> {
-        // Get Room Handle
-        let handle = match self.room_manager.get_room(room_id.clone()).await {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("Client {} : failed to find room {}: {}", self.id, room_id, e);
-                self.send_packet(PacketTag::TextError, format!("Room '{}' not found.", room_id).as_bytes()).await?;
-                return Ok(());
-            }
-        };
-        // Try join room
-        if let Err(e) = handle.join(self.id.clone(), self.sender.clone()).await {
-            eprintln!("Client {} : failed to join room actor {}: {}", self.id, room_id, e);
-            self.send_packet(PacketTag::TextError, format!("Failed to enter room: {}", e).as_bytes()).await?;
-            return Ok(());
-        };
-        self.joined_rooms.insert(room_id.clone(), handle);
-        println!("Client {}: Joined Room '{}'", self.id, room_id);
-        Ok(())
+        assert_eq!(&frame[..], b"current reply");
     }
 }

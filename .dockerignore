@@ -1,0 +1,12 @@
+.git
+target
+docs
+.superpowers
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/.aws
+**/credentials

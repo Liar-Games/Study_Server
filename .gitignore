@@ -1,2 +1,13 @@
 /target
 /.vscode
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+/secrets/
+/credentials/
+.aws/
